@@ -36,12 +36,30 @@ import static java.nio.ByteOrder.BIG_ENDIAN;
             - MappedMemorySegment.asSlice / toArray [cityString into template]
             - MappedMemorySegment.asSlice / toArray / toString (parseDouble precursor)
 
-    Second iteration: Custom double parsing profiling
-        1. turning the city name bytes into an array and generating the hash code is **costly**
-        2. HashMap get/contains also costly
-        3. reading the city bytes to find the ';'
+    Second iteration: Custom double parsing
+        * remove Double.parse entirely (well, edge-case around very last measurement in the file and bounds)
 
-    Third iteration: custom HashMap implementation to work with byte[] directly perhaps?
+        Costly activities
+            1. turning the city name bytes into an array and generating the hash code is **costly**
+            2. HashMap get/contains also costly
+            3. reading the city bytes to find the ';'
+
+    Third iteration:
+        * incremental hash calculation
+        * don't create an array of bytes from the memory segment each time, directly populate an existing template
+        * better use of template via breaking encapsulation
+        * tweaking measurement conversion
+
+        Costly activities:
+            1. HashMap.get (and the CityStat equals method)
+            2. #extractMeasurement
+            3. HashMap.containsKey (see 1)
+            4. MemorySegment.get (byte, when reading the city name)
+
+    Fourth iteration:
+        ~43% time spent on the HashMap get/contains calls - reluctant to implement a new one right now but it's an obvious win
+        Time to throw more threads at the work, this should make a significant different
+
  */
 
 public class CalculateAverage_rjk {
@@ -54,6 +72,8 @@ public class CalculateAverage_rjk {
     // Gunnar baseline: 110,302
     // First          : 109,389     (mmap & offHeap access)
     // Second         :  52,745     (custom parse double)
+    // Third          :  38,996     (incremental hash ++)
+    // Fourth         :
 
     /**
      * utility class for rough & ready timing
@@ -85,45 +105,40 @@ public class CalculateAverage_rjk {
      * Second, rewrite the Double parsing logic to avoid creating garbage or using the build in Java methods
      */
     @SuppressWarnings("preview")
-    private static class CustomDoubleParsing {
+    private static class IncrementalHashCalculation {
 
         public static final ValueLayout.OfLong LONG_UNALIGNED_BE = JAVA_LONG.withOrder(BIG_ENDIAN).withByteAlignment(1);
         public static final long LONG_MASK_MINUS_FIRST_BYTE = (long) '-' << (7 * 8);
         private long sourceOffset;
+        // 52 cities
+        private final Map<CityStat, CityStat> stats = HashMap.newHashMap(52);
 
         private static class CityStat {
-            byte[] cityBytes;
-            String cityString = null;
-            int cityHash;
+            byte[] bytes;
+            int length;
+            int hash;
+
             double min = Double.MAX_VALUE;
             double max = Double.MIN_VALUE;
             int measurementCount = 0;
             double cumulative = 0;
+            String summaryString = null;
 
             public CityStat() {
+                // constructor only used once to create a resusable template that can hold any city name
+                this.bytes = new byte[27];
             }
 
             /**
-             * Copy constructor, simply to set the cityBytes and hash so we can use this instance as a key
+             * Copy constructor, populate a new instance from a template
              *
              * @param template pre-populated with the bytes of a city name and the corresponding hash code
              */
             @SuppressWarnings("CopyConstructorMissesField")
             public CityStat(CityStat template) {
-                this.cityBytes = template.cityBytes;
-                this.cityHash = template.cityHash;
-            }
-
-            /**
-             * Read the city name from the MemorySegment as bytes and calculate a hashCode
-             *
-             * @param source buffer
-             * @param offset start
-             * @param length city name length
-             */
-            public void read(MemorySegment source, long offset, long length) {
-                this.cityBytes = source.asSlice(offset, length).toArray(JAVA_BYTE);
-                this.cityHash = Arrays.hashCode(cityBytes);
+                this.bytes = Arrays.copyOf(template.bytes, template.bytes.length);
+                this.length = template.length;
+                this.hash = template.hash;
             }
 
             /**
@@ -137,66 +152,78 @@ public class CalculateAverage_rjk {
             }
 
             private String cityString() {
-                return new String(cityBytes, StandardCharsets.UTF_8);
+                return new String(bytes, 0, length, StandardCharsets.UTF_8);
             }
 
             @Override
             public boolean equals(Object o) {
-                if (this == o) return true;
-                if (!(o instanceof CityStat cityStat)) return false;
-                return Objects.deepEquals(cityBytes, cityStat.cityBytes);
+                if (o instanceof CityStat cityStat && length == cityStat.length) {
+                    return Arrays.mismatch(bytes, 0, length, cityStat.bytes, 0, length) < 0;
+                }
+
+                return false;
             }
 
             @Override
             public int hashCode() {
-                return cityHash;
+                return hash;
             }
 
             @Override
             public String toString() {
-                if (cityString == null) {
-                    cityString = "%s=%.1f/%.1f/%.1f".formatted(cityString(), min, cumulative / measurementCount, max);
+                if (summaryString == null) {
+                    summaryString = "%s=%.1f/%.1f/%.1f".formatted(cityString(), min, cumulative / measurementCount, max);
                 }
-                return cityString;
+                return summaryString;
             }
         }
-
-        private final Map<CityStat, CityStat> stats = new HashMap<>();
 
         public String compute(MemorySegment source) {
             sourceOffset = 0;
             byte lastChar;
-            long startOfCity = 0;
 
             CityStat template = new CityStat();
+            int length = 0;
+            int hash = 0;
 
-            while (sourceOffset < source.byteSize() && (lastChar = source.get(JAVA_BYTE, sourceOffset++)) != (byte) '\n') {
+            long sourceSize = source.byteSize();
+
+            while (sourceOffset <  sourceSize
+                    && (lastChar = source.get(JAVA_BYTE, sourceOffset++)) != (byte) '\n') {
+
+                template.bytes[length++] = lastChar;
+                // incrementally calculate the hash code
+                hash = 31 * hash + lastChar;
 
                 if (lastChar == ';') {
-                    long cityLength = sourceOffset - startOfCity - 1;
+                    // the ';' is not part of the name
+                    template.length = --length;
+                    template.hash = hash;
 
-                    template.read(source, startOfCity, cityLength);
+                    // somewhat astonishingly the following  works:
+                    // CityStat cityStat = stats.computeIfAbsent(template, CityStat::new);
+                    // even though all values will share the same key object - and it's faster...
+                    //
+                    // I suspect the buckets are sparsely populated and every element in the bucket would need an equals
+                    // comparison anyway - however it's likely all hell will break loose on a resize
                     CityStat cityStat = stats.get(template);
                     if (!stats.containsKey(template)) {
                         cityStat = new CityStat(template);
                         stats.put(cityStat, cityStat);
                     }
 
-
                     double measurement = extractMeasurement(source);
                     cityStat.add(measurement);
 
-                    sourceOffset++;   // advance beyond the \n
-                    startOfCity = sourceOffset;
+                    length = 0;
+                    hash = 0;
                 }
             }
 
-            return "{" +
-                    stats.values().stream()
-                            .sorted(Comparator.comparing(CityStat::cityString))
-                            .map(CityStat::toString)
-                            .collect(Collectors.joining(", "))
-                    + "}";
+            return STR."{\{stats.values().stream()
+                    .sorted(Comparator.comparing(CityStat::cityString))
+                    .map(CityStat::toString)
+                    .collect(Collectors.joining(", "))}}";
         }
 
         /**
@@ -222,7 +249,7 @@ public class CalculateAverage_rjk {
 
             int accumulator = 0;
             double doubleValue;
-            int byteOffsetInLong = 8;   // big endian, our measurement is read left to right
+            int byteOffsetInLong = 7;   // read left to right
 
             long measurementBytes = source.get(LONG_UNALIGNED_BE, sourceOffset);
 
@@ -233,21 +260,21 @@ public class CalculateAverage_rjk {
             }
 
             // could unroll this loop given there are only a handful of possibilities where the decimal place can be.
-            // Lower hanging fruit is available at the moment though
+            // Lower hanging fruit remains available
             while (true) {
 
                 // get next byte in the measurement string
-                byte measurementByte = (byte) ((measurementBytes >> (8 * (byteOffsetInLong - 1))) & 0x7F);
+                byte measurementByte = (byte) ((measurementBytes >> (8 * (byteOffsetInLong))) & 0x7F);
 
                 // all measurements are to 1 decimal place so we can finalise and stop once the decimal place is found
                 if (measurementByte == '.') {
+                    byte lastByte = (byte) (measurementBytes >> 8 * (byteOffsetInLong - 1) & 0x7F);
+                    lastByte -= '0';
                     doubleValue = accumulator;
-                    byte lastByte = (byte) ((measurementBytes >> (8 * (byteOffsetInLong - 2))) & 0x7F);
-                    doubleValue += (lastByte - '0') / 10.0;
+                    doubleValue += (lastByte / 10.0);
 
-                    // 0 or 1 '-' + 1 or 2 for the integer component + '.' + 1 decimal
-                    // byteOffsetInLong has already advanced for the possible '-' and the integers
-                    sourceOffset += 8 - byteOffsetInLong + 2;
+                    // advance sourceOffset by the integer component + 3 bytes for '.' + 'number' + '\n'
+                    sourceOffset += (7 + 3 ) - byteOffsetInLong;
 
                     if (isNegative) {
                         doubleValue = -doubleValue;
@@ -274,7 +301,7 @@ public class CalculateAverage_rjk {
 
             Timer timer = new Timer();
 
-            String result = new CustomDoubleParsing().compute(source);
+            String result = new IncrementalHashCalculation().compute(source);
 
             if (!result.equals(GUNNAR_OUTPUT)) {
                 System.err.println(GUNNAR_OUTPUT);
