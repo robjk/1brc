@@ -62,6 +62,8 @@ public class CalculateAverage_baseline {
         // .collect(toMap(e -> e.getKey(), e -> Math.round(e.getValue() * 10.0) / 10.0)));
         // System.out.println(measurements1);
 
+        CalculateAverage_rjk.Timer timer = new CalculateAverage_rjk.Timer();
+
         Collector<Measurement, MeasurementAggregator, ResultRow> collector = Collector.of(
                 MeasurementAggregator::new,
                 (a, m) -> {
@@ -86,6 +88,8 @@ public class CalculateAverage_baseline {
         Map<String, ResultRow> measurements = new TreeMap<>(Files.lines(Paths.get(FILE))
                 .map(l -> new Measurement(l.split(";")))
                 .collect(groupingBy(m -> m.station(), collector)));
+
+        System.out.println(timer);
 
         System.out.println(measurements);
     }
