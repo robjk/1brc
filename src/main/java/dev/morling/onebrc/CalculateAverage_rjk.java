@@ -21,140 +21,25 @@ import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED;
 import static java.nio.ByteOrder.LITTLE_ENDIAN;
 
-/*
-    Development notes
-
-    Theory: MemorySegments should allow us to mmap and parse the file no worse than baseline, open up further optimisations
-        - results: marginally faster on a noisy windows machine - profiling highlights the following CPU sinks:
-            - MemorySegment to array hit for station name byte[]
-            - MemorySegment.get calls to read a byte from the mmap file
-            - new String as the precursor to Double.ParseDouble
-            - Double.parseDouble
-            - HashMap.contains calls (equals)
-            - HashMap.get calls (equals)
-        - highest cost activities
-            1. Double.parseDouble + reading from the MemorySegment -> String
-            2. reading the station into an array
-            3. HashMap get + HashMap contains
-        - garbage creation
-            - #1 Double.parseDouble
-            - MappedMemorySegment.asSlice / toArray [stationString into template]
-            - MappedMemorySegment.asSlice / toArray / toString (parseDouble precursor)
-
-    Second iteration: Custom double parsing
-        * remove Double.parse entirely (well, edge-case around very last measurement in the file and bounds)
-
-        Costly activities
-            1. turning the station name bytes into an array and generating the hash code is **costly**
-            2. HashMap get/contains also costly
-            3. reading the station bytes to find the ';'
-
-    Third iteration:
-        * incremental hash calculation
-        * don't create an array of bytes from the memory segment each time, directly populate an existing template
-        * better use of template via breaking encapsulation
-        * tweaking measurement conversion
-
-        Costly activities:
-            1. HashMap.get (and the StationStat equals method)
-            2. #extractMeasurement
-            3. HashMap.containsKey (see 1)
-            4. MemorySegment.get (byte, when reading the station name)
-
-    Note: measurements.txt was recreated after Third iteration, making comparision with future iterations questionnable.
-    However, moving to multiple-threads will be a step change in performance.
-
-    Fourth iteration:
-        In iteration 3, ~43% time spent on the HashMap get/contains calls - reluctant to implement a new one right now but it's an obvious win
-
-        Time to throw more threads at the work, this will make a significant change
-
-            * Split the work across multiple threads by giving each of them a segment in the file to process, then collate
-                the results together at the end.  This will require logic to identify the location of a nearby '\n' given we
-                won't know where they are when we pick a starting offset for a thread
-
-        Notes on implementation
-            * start up time and shut down time are not being measured, so currently comparable vs previous
-                implementations of my own but not anyone else
-            * Stricter adherence to the competition rules (can be configured to support max number of stations, assumes max station name length)
-            * As described above, file mmapped into the global arena (avoids memory barriers enforced by shared)
-            * 8 threads (as per rules) each given a starting offset at n/8 bytes into the memory region
-            * threads check that the previous byte is not a '\n' (= they are at a valid start position)
-                if they are not at a valid start position walk forward until next '\n' is found
-            * threads process sequentially, and all but the last thread are allowed to slightly overrun to complete a
-                partially processed measurement (the thread dealing with the next segment will have skipped it)
-            * debug validity checks added, will be removed when chasing the smaller gains
-            * oddly, introducing a call to system.out.printf (or println) in a non-critical setup loop consistently
-                improves the performance.  profiling suggests that the hashmap getNode performs worse (amongst other)
-                without it.  JITWatch didn't immediately through up anything so this is deferred for a later
-                optimisation phase.  For now the hack is *not* included as an official result
-
-        Profiling notes
-            1. HashMap.get still hurts
-            2. extractMeasurement, half the time is reading the long from the memory segment, remainder needs a closer look
-            3. reading the individual bytes of the station name
-
-            for 2 above, we're suffering an endian conversion, this can be fixed
-            also, JITWatch is highlighting large methods impacting inlining decisions, it may be fruitful to look at
-            that
-
-    Fifth iteration:
-        Improved measurement decoding / switched endianness for long reads
-
-    Sixth iteration:
-        revisited the measurement decode, realised the blindingly obvious fact that I don't need to read a long and can
-        perform the full decode by checking for a '-' then reading an int.
-        This gets rid of the stupid final measurement edge-case - also checked the generated byte code to confirm that
-        easier to read intermediate stages in the calculation are not optimised out by the compiler
-
-        Started to clean up the nastiness around the Map and key/value but it needs something more radical.  I've been
-        putting it off since profiling the very first iteration but next it will be time to look at a custom HashMap
-        solution
-
-    Seventh iteration:
-        custom map implementation from Knuth, replaced the exceptionally nasty key/value situation before with a single
-        slot entry to represent the cumulative station measurement
-        one map per worker thread, collated at end (collation/display is not optimised, but costs ~1% of runtime)
-        minor rearrangements to try and reduce the bytecode size of hot methods to allow for improved inlining
-            note: total execution time is the driver still, but some of the above really require verification that they
-                  are doing what I expect them to do (i.e JITWatch before/after)
-        i confess, i'd hoped for a bigger improvement but the station name comparison is costly
-        ditched Arrays.mismatch as it didn't appear to perform as well as a simple iteration over the byte[] (whither intrinsics?)
-
-        Profiling outcome
-            1. StationResult.equals (comparing the latest station name bytes with those in the map slots)
-            2. extractMeasurement (it's not immediately obvious how to improve this further - more detailed investigation necessary)
-            3. MemorySegment.get(BYTE) - i.e reading the station name, alternatives (wider-reads) could be fruitful
-
-        Ideas
-            1 & 3 are linked - would wider reads/comparisons for station names perform better than byte-by-byte compare
-
-    Eighth iteration:
-        stop reading the station name byte by byte, instead move to 4-byte ints
-        most station names are longer than 4 bytes and it proved to be more performant to read the first two ints of
-            the station name, and performing int comparisons when required for equality checks (falling back to
-            remaining bytes where they're otherwise the same)
-        introduce some bit-hackery to search for the end delimiter of the station name, this was a good performance bump
-        spent a little time reducing the size of methods to imprive inline possibilities, _apart from_ the new
-            StationRecord instances the hot-path is inlined well now
-
-        Ideas
-            aligned reads, there's an option of scanning through the data using aligned reads, then bit-manipulation to
-                hunt for ';' and '\n'
-            Classloading - is that introducing delays
-            VM parameter tweaking - vanilla settings so far, compilation parameters perhaps?
-            StationResult is comparatively large (fields and methods) - strip this down
-            MemorySegment usage: would ByteBuffers work as well/better?
-            no effort has been made to improve the final collation and string construction for printing, there are
-                definitely options for improvement here
-            i'm sure there are costs with mmapping the whole file into ram with equal sized segments/worker thread
-
-        Stopping here:
-            I'd like to look at other solutions and see the clever ideas I failed to think of, but that will inevitably
-                pollute my thinking
-            There are other things I'm interested in doing :)
- */
-
+// Total elapsed times are not rigorous, methodology is to run repeatedly on a Windows machine and take somewhere
+// in the middle of the range for the table below.  The variation in timings over repeated runs is now at the stage
+// more serious approaches to measurement are required.
+//
+// Gunnar's test machine: (32 core AMD EPYC™ 7502P (Zen2), 128 GB RAM)
+// My rig: (12 core AMD Ryzen 9 5900X, 64 GB RAM)
+//
+// As per Gunnar, tests are performed with _8 cores_ and (in my case) 64GB RAM
+//
+// Gunnar baseline: 110,302
+//
+// First          : 109,389             (mmap & offHeap access)
+// Second         :  52,745             (custom parse double)
+// Third          :  38,996             (incremental hash ++)
+// Fourth         :  8,002  (4,803*)    (multi-threaded, * = spurious improvement due to printf, needs explaining)
+// Fifth          :  4,833              (multi-threading tidy-up, improved measurement decode, endianness)
+// Sixth          :  4,690              (measurement decoding optimisation)
+// Seventh        :  4,220              (custom map)
+// Eighth         :  3,733              (4-byte station reading + bit hackery)
 public class CalculateAverage_rjk {
 
     // restrict to 3/4 of the cores on my test machine
@@ -169,20 +54,6 @@ public class CalculateAverage_rjk {
     public static final int POSITION_MASK = MAP_SIZE - 1;
     public static final int HASH_CONSTANT = 11587;
     public static final int MAX_STATION_NAME_LENGTH = 100;
-
-    // Total elapsed times are not rigorous, methodology is to run repeatedly on a Windows machine and take somewhere
-    // in the middle of the range for the table below.  The variation in timings over repeated runs is now at the stage
-    // more serious approaches to measurement are required.
-
-    // Gunnar baseline: 110,302
-    // First          : 109,389             (mmap & offHeap access)
-    // Second         :  52,745             (custom parse double)
-    // Third          :  38,996             (incremental hash ++)
-    // Fourth         :  8,002  (4,803*)    (multi-threaded, * = spurious improvement due to printf, needs explaining)
-    // Fifth          :  4,833              (multi-threading tidy-up, improved measurement decode, endianness)
-    // Sixth          :  4,690              (measurement decoding optimisation)
-    // Seventh        :  4,220              (custom map)
-    // Eighth         :  3,733              (4-byte station reading + bit hackery)
 
     private static class StationResult {
         byte[] bytes;
