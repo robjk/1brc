@@ -1,3 +1,6 @@
+## Source
+[CalculateAverage_robjk.java](src/main/java/dev/morling/onebrc/CalculateAverage_robjk.java)
+
 ## Caveats
 
 * All executions are on my local **Windows** machine

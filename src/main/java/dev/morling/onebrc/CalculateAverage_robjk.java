@@ -40,7 +40,7 @@ import static java.nio.ByteOrder.LITTLE_ENDIAN;
 // Sixth          :  4,690              (measurement decoding optimisation)
 // Seventh        :  4,220              (custom map)
 // Eighth         :  3,733              (4-byte station reading + bit hackery)
-public class CalculateAverage_rjk {
+public class CalculateAverage_robjk {
 
     // restrict to 3/4 of the cores on my test machine
     public static final int THREAD_COUNT = 8;
@@ -508,7 +508,7 @@ public class CalculateAverage_rjk {
                 .toList()
                 .stream()
                 .skip(1)
-                .map(CalculateAverage_rjk::uncheckedGet)
+                .map(CalculateAverage_robjk::uncheckedGet)
                 .forEach(first::merge);
 
         return first.toString();

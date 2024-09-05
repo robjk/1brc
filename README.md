@@ -26,7 +26,7 @@ Oh boy 👏
 
 ## My attempt
 
-* [Click here](README_rjk.md) to see a description of the various iterations
+* [Click here](README_robjk.md) to see a description of the various iterations
 * Ultimately, I stopped at a processing time of just under 4 seconds (**~3,733ms**) - see the link for caveats
 
 ## What was learnt
